@@ -12,20 +12,7 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
 
     super({
       adapter,
-      log:['query','error']
-      //comments: [queryTags(), traceContext()],
-      //👆
-      //https://www.prisma.io/docs/orm/reference/prisma-client-reference
-      /*
-      Prisma Query Extensions used for Observability.
-      enabling End-to-End Tracing.
-
-      @prisma/sqlcommenter-query-tags
-      Adds arbitrary tags to queries within an async context using AsyncLocalStorage
-      
-      @prisma/sqlcommenter-trace-context
-      Adds W3C Trace Context (traceparent) headers for distributed tracing
-      */
+      log:['query','error'] // record the SQL query and error
     });
   }
   
