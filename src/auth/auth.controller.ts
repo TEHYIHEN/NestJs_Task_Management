@@ -6,6 +6,7 @@ import { JwtRefreshGuard } from './guards/jwt-refresh.guard';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { LocalAuthGuard } from './guards/local-auth.guard';
 import { CurrentUser } from './decorators/current-user.decorator';
+import { Public } from './decorators/public.decorator';
 
 const COOKIE_OPTIONS = {
   httpOnly: true,
@@ -18,6 +19,7 @@ const COOKIE_OPTIONS = {
 export class AuthController {
   constructor(private authService: AuthService) {}
 
+  @Public()
   @Post('register')
   async register(
     @Body() dto: RegisterDto,

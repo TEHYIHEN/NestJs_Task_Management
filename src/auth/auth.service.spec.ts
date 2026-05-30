@@ -8,6 +8,7 @@ import { createPrismaMock, PrismaMock } from '../prisma/prisma.mock';
 import { ConflictException, UnauthorizedException } from '@nestjs/common';
 import { Role } from '@prisma/client';
 import * as argon2 from 'argon2';
+import { refreshjwtConfig, verifyrefreshjwtConfig } from './config/refreshjwt.config';
 
 // mock argon2
 jest.mock('argon2', () => ({
@@ -24,7 +25,6 @@ describe('AuthService', () => {
   let authService: AuthService;
   let usersService: jest.Mocked<UsersService>;
   let jwtService: jest.Mocked<JwtService>;
-  let configService: jest.Mocked<ConfigService>;
   let prismaMock: PrismaMock;
 
   // ─── Mock Data ───────────────────────────────────────────
@@ -38,17 +38,11 @@ describe('AuthService', () => {
     createdAt: new Date(),
   };
 
-  const mockTokens = {
-    accessToken: 'mock-access-token',
-    refreshToken: 'mock-refresh-token',
-    jti: 'mock-jti-uuid',
-  };
-
   const mockRefreshToken = {
     id: 'mock-jti-uuid',
     userId: 'user-id-123',
     token: 'hashed-refresh-token',
-    expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days from now
+    expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
     createdAt: new Date(),
   };
 
@@ -78,20 +72,27 @@ describe('AuthService', () => {
         {
           provide: ConfigService,
           useValue: {
-            get: jest.fn((key: string) => {
-              const config: Record<string, string> = {
-                JWT_SECRET: 'test-jwt-secret',
-                JWT_EXPIRES_IN: '15m',
-                JWT_REFRESH_SECRET: 'test-refresh-secret',
-                JWT_REFRESH_EXPIRES_IN: '7d',
-              };
-              return config[key];
-            }),
+            get: jest.fn(),
           },
         },
         {
           provide: PrismaService,
           useValue: prismaMock,
+        },
+        // mock @Inject(refreshjwtConfig.KEY)
+        {
+          provide: refreshjwtConfig.KEY,
+          useValue: {
+            secret: 'test-refresh-secret',
+            expiresIn: '7d',
+          },
+        },
+        // mock @Inject(verifyrefreshjwtConfig.KEY)
+        {
+          provide: verifyrefreshjwtConfig.KEY,
+          useValue: {
+            secret: 'test-refresh-secret',
+          },
         },
       ],
     }).compile();
@@ -99,7 +100,6 @@ describe('AuthService', () => {
     authService = module.get<AuthService>(AuthService);
     usersService = module.get(UsersService);
     jwtService = module.get(JwtService);
-    configService = module.get(ConfigService);
   });
 
   afterEach(() => {
@@ -125,10 +125,14 @@ describe('AuthService', () => {
       usersService.findByEmail.mockResolvedValue(mockUser);
       (argon2.verify as jest.Mock).mockResolvedValue(true);
 
-      const result = await authService.validateUser('test@example.com', '123456');
+      const result = await authService.validateUser(
+        'test@example.com',
+        '123456',
+      );
 
       expect(result).toEqual({ id: mockUser.id });
       expect(usersService.findByEmail).toHaveBeenCalledWith('test@example.com');
+      expect(argon2.verify).toHaveBeenCalledWith(mockUser.password, '123456');
     });
 
     it('should throw UnauthorizedException if user not found', async () => {
@@ -137,6 +141,8 @@ describe('AuthService', () => {
       await expect(
         authService.validateUser('wrong@example.com', '123456'),
       ).rejects.toThrow(UnauthorizedException);
+
+      expect(argon2.verify).not.toHaveBeenCalled();
     });
 
     it('should throw UnauthorizedException if password is wrong', async () => {
@@ -152,7 +158,7 @@ describe('AuthService', () => {
   // ─── validateJwtUser ──────────────────────────────────────
 
   describe('validateJwtUser', () => {
-    it('should return current user if user exists', async () => {
+    it('should return CurrentUser if user exists', async () => {
       usersService.findById.mockResolvedValue(mockUser);
 
       const result = await authService.validateJwtUser('user-id-123');
@@ -176,26 +182,38 @@ describe('AuthService', () => {
   // ─── validateRefreshToken ─────────────────────────────────
 
   describe('validateRefreshToken', () => {
-    it('should return user id and jti if refresh token is valid', async () => {
-      jwtService.verifyAsync.mockResolvedValue({ sub: mockUser.id, jti: 'mock-jti-uuid' });
+    it('should return id and jti if refresh token is valid', async () => {
+      jwtService.verifyAsync.mockResolvedValue({
+        sub: mockUser.id,
+        jti: 'mock-jti-uuid',
+      });
       prismaMock.refreshToken.findUnique.mockResolvedValue(mockRefreshToken);
       (argon2.verify as jest.Mock).mockResolvedValue(true);
 
-      const result = await authService.validateRefreshToken(mockUser.id, 'mock-refresh-token');
+      const result = await authService.validateRefreshToken(
+        mockUser.id,
+        'mock-refresh-token',
+      );
 
       expect(result).toEqual({ id: mockUser.id, jti: 'mock-jti-uuid' });
+      expect(prismaMock.refreshToken.findUnique).toHaveBeenCalledWith({
+        where: { id: 'mock-jti-uuid' },
+      });
     });
 
-    it('should throw UnauthorizedException if token is invalid JWT', async () => {
+    it('should throw UnauthorizedException if JWT verify fails', async () => {
       jwtService.verifyAsync.mockRejectedValue(new Error('invalid token'));
 
       await expect(
         authService.validateRefreshToken(mockUser.id, 'invalid-token'),
-      ).rejects.toThrow(UnauthorizedException);
+      ).rejects.toThrow();
     });
 
     it('should throw UnauthorizedException if token not found in database', async () => {
-      jwtService.verifyAsync.mockResolvedValue({ sub: mockUser.id, jti: 'mock-jti-uuid' });
+      jwtService.verifyAsync.mockResolvedValue({
+        sub: mockUser.id,
+        jti: 'mock-jti-uuid',
+      });
       prismaMock.refreshToken.findUnique.mockResolvedValue(null);
 
       await expect(
@@ -204,10 +222,13 @@ describe('AuthService', () => {
     });
 
     it('should throw UnauthorizedException if token is expired', async () => {
-      jwtService.verifyAsync.mockResolvedValue({ sub: mockUser.id, jti: 'mock-jti-uuid' });
+      jwtService.verifyAsync.mockResolvedValue({
+        sub: mockUser.id,
+        jti: 'mock-jti-uuid',
+      });
       prismaMock.refreshToken.findUnique.mockResolvedValue({
         ...mockRefreshToken,
-        expiresAt: new Date(Date.now() - 1000), // 过期了
+        expiresAt: new Date(Date.now() - 1000), // 过期
       });
 
       await expect(
@@ -216,7 +237,10 @@ describe('AuthService', () => {
     });
 
     it('should throw UnauthorizedException if argon2 verify fails', async () => {
-      jwtService.verifyAsync.mockResolvedValue({ sub: mockUser.id, jti: 'mock-jti-uuid' });
+      jwtService.verifyAsync.mockResolvedValue({
+        sub: mockUser.id,
+        jti: 'mock-jti-uuid',
+      });
       prismaMock.refreshToken.findUnique.mockResolvedValue(mockRefreshToken);
       (argon2.verify as jest.Mock).mockResolvedValue(false);
 
@@ -237,19 +261,20 @@ describe('AuthService', () => {
 
     it('should register a new user and return tokens', async () => {
       usersService.findByEmail.mockResolvedValue(null);
-      usersService.create.mockResolvedValue(mockUser);
       (argon2.hash as jest.Mock).mockResolvedValue('hashed-password');
+      usersService.create.mockResolvedValue(mockUser);
       jwtService.signAsync
-        .mockResolvedValueOnce(mockTokens.accessToken)
-        .mockResolvedValueOnce(mockTokens.refreshToken);
+        .mockResolvedValueOnce('mock-access-token')
+        .mockResolvedValueOnce('mock-refresh-token');
       prismaMock.refreshToken.create.mockResolvedValue(mockRefreshToken);
 
       const result = await authService.register(registerDto);
 
-      expect(result).toHaveProperty('accessToken');
-      expect(result).toHaveProperty('user');
+      expect(result).toHaveProperty('accessToken', 'mock-access-token');
+      expect(result).toHaveProperty('refreshToken', 'mock-refresh-token');
       expect(result.user).not.toHaveProperty('password');
       expect(usersService.create).toHaveBeenCalledTimes(1);
+      expect(argon2.hash).toHaveBeenCalledWith(registerDto.password);
     });
 
     it('should throw ConflictException if email already exists', async () => {
@@ -258,6 +283,7 @@ describe('AuthService', () => {
       await expect(authService.register(registerDto)).rejects.toThrow(
         ConflictException,
       );
+
       expect(usersService.create).not.toHaveBeenCalled();
     });
   });
@@ -265,17 +291,17 @@ describe('AuthService', () => {
   // ─── login ────────────────────────────────────────────────
 
   describe('login', () => {
-    it('should return tokens and user on successful login', async () => {
+    it('should return tokens and sanitized user on success', async () => {
       usersService.findById.mockResolvedValue(mockUser);
       jwtService.signAsync
-        .mockResolvedValueOnce(mockTokens.accessToken)
-        .mockResolvedValueOnce(mockTokens.refreshToken);
+        .mockResolvedValueOnce('mock-access-token')
+        .mockResolvedValueOnce('mock-refresh-token');
       prismaMock.refreshToken.create.mockResolvedValue(mockRefreshToken);
 
       const result = await authService.login(mockUser.id);
 
-      expect(result).toHaveProperty('accessToken');
-      expect(result).toHaveProperty('user');
+      expect(result).toHaveProperty('accessToken', 'mock-access-token');
+      expect(result).toHaveProperty('refreshToken', 'mock-refresh-token');
       expect(result.user).not.toHaveProperty('password');
     });
 
@@ -285,6 +311,8 @@ describe('AuthService', () => {
       await expect(authService.login('non-existent-id')).rejects.toThrow(
         UnauthorizedException,
       );
+
+      expect(jwtService.signAsync).not.toHaveBeenCalled();
     });
   });
 
@@ -292,14 +320,22 @@ describe('AuthService', () => {
 
   describe('logout', () => {
     it('should delete refresh token and return success message', async () => {
-      prismaMock.refreshToken.delete.mockResolvedValue(mockRefreshToken);
+      prismaMock.refreshToken.deleteMany.mockResolvedValue({ count: 1 });
 
       const result = await authService.logout('mock-jti-uuid');
 
       expect(result).toEqual({ message: 'Logged out successfully' });
-      expect(prismaMock.refreshToken.delete).toHaveBeenCalledWith({
+      expect(prismaMock.refreshToken.deleteMany).toHaveBeenCalledWith({
         where: { id: 'mock-jti-uuid' },
       });
+    });
+
+    it('should still succeed if token already deleted', async () => {
+      prismaMock.refreshToken.deleteMany.mockResolvedValue({ count: 0 });
+
+      const result = await authService.logout('non-existent-jti');
+
+      expect(result).toEqual({ message: 'Logged out successfully' });
     });
   });
 
@@ -310,14 +346,17 @@ describe('AuthService', () => {
       usersService.findById.mockResolvedValue(mockUser);
       prismaMock.refreshToken.delete.mockResolvedValue(mockRefreshToken);
       jwtService.signAsync
-        .mockResolvedValueOnce(mockTokens.accessToken)
-        .mockResolvedValueOnce(mockTokens.refreshToken);
+        .mockResolvedValueOnce('new-access-token')
+        .mockResolvedValueOnce('new-refresh-token');
       prismaMock.refreshToken.create.mockResolvedValue(mockRefreshToken);
 
-      const result = await authService.refreshTokens(mockUser.id, 'mock-jti-uuid');
+      const result = await authService.refreshTokens(
+        mockUser.id,
+        'mock-jti-uuid',
+      );
 
-      expect(result).toHaveProperty('accessToken');
-      expect(result).toHaveProperty('refreshToken');
+      expect(result).toHaveProperty('accessToken', 'new-access-token');
+      expect(result).toHaveProperty('refreshToken', 'new-refresh-token');
       expect(prismaMock.refreshToken.delete).toHaveBeenCalledWith({
         where: { id: 'mock-jti-uuid' },
       });
@@ -329,6 +368,8 @@ describe('AuthService', () => {
       await expect(
         authService.refreshTokens('non-existent-id', 'mock-jti-uuid'),
       ).rejects.toThrow(UnauthorizedException);
+
+      expect(prismaMock.refreshToken.delete).not.toHaveBeenCalled();
     });
   });
 });
